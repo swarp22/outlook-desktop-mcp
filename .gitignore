@@ -6,3 +6,7 @@ build/
 .venv/
 *.egg
 .eggs/
+
+# Claude Code local context (not shared in repo)
+CLAUDE.md
+.claude/
