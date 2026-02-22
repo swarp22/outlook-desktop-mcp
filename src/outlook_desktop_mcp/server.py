@@ -16,11 +16,14 @@ from mcp.server.fastmcp import FastMCP
 from outlook_desktop_mcp.com_bridge import OutlookBridge
 from datetime import datetime, timedelta
 
+import os
+
 from outlook_desktop_mcp.tools._folder_constants import (
     FOLDER_NAME_TO_ENUM,
     OL_MAIL_ITEM,
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
+    OL_FOLDER_TASKS,
     OL_MEETING,
     OL_MEETING_CANCELED,
     OL_RESPONSE_TENTATIVE,
@@ -28,12 +31,18 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_RESPONSE_DECLINED,
     OL_REQUIRED,
     OL_OPTIONAL,
+    OL_TASK_ITEM,
+    OL_TASK_COMPLETE,
+    TASK_STATUS_NAMES,
+    IMPORTANCE_NAMES,
 )
 from outlook_desktop_mcp.utils.formatting import (
     format_email_summary,
     format_email_full,
     format_event_summary,
     format_event_full,
+    format_task_summary,
+    format_task_full,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
 
@@ -62,13 +71,14 @@ mcp = FastMCP(
         "PREREQUISITE: Outlook Desktop (Classic) must be running. The new/modern "
         "Outlook (olk.exe) is NOT supported — only the classic OUTLOOK.EXE.\n\n"
         "AVAILABLE TOOL CATEGORIES:\n"
-        "- Email: send, list, read, search, reply, mark read/unread, move\n"
+        "- Email: send, list, read, search, reply, mark read/unread, move, attachments\n"
         "- Calendar: list events, create appointments/meetings, update, delete, "
         "respond to invites, search events\n"
-        "- Folders: list folder hierarchy with item counts\n\n"
-        "PLANNED (not yet implemented):\n"
-        "- Contacts: address book lookups\n"
-        "- Tasks: to-do items"
+        "- Tasks: create, list, complete, update, delete to-do items\n"
+        "- Categories: list and set color categories on any item\n"
+        "- Rules: list and manage mail rules\n"
+        "- Out of Office: check auto-reply status\n"
+        "- Folders: list folder hierarchy with item counts"
     ),
 )
 
@@ -968,6 +978,408 @@ async def search_events(
         return await bridge.call(_search, query, start_date, end_date, count)
     except Exception as e:
         return f"Error searching events: {format_com_error(e)}"
+
+
+# =====================================================================
+# TASK TOOLS
+# =====================================================================
+
+@mcp.tool()
+async def list_tasks(
+    include_completed: bool = False,
+    count: int = 20,
+) -> str:
+    """List tasks from the Outlook Tasks folder.
+
+    Returns a JSON array of task summaries sorted by due date. Each task
+    includes entry_id, subject, status, percent_complete, due_date,
+    importance, and categories.
+
+    Args:
+        include_completed: If true, include completed tasks. Default false
+            (only pending/in-progress tasks).
+        count: Maximum number of tasks to return. Default 20.
+
+    Returns:
+        JSON array of task summary objects.
+    """
+    def _list(outlook, namespace, include_completed, count):
+        folder = namespace.GetDefaultFolder(OL_FOLDER_TASKS)
+        items = folder.Items
+        items.Sort("[DueDate]")
+
+        if not include_completed:
+            items = items.Restrict("[Complete] = False")
+
+        results = []
+        limit = min(count, items.Count)
+        for i in range(limit):
+            try:
+                results.append(format_task_summary(items.Item(i + 1)))
+            except Exception:
+                continue
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, include_completed, count)
+    except Exception as e:
+        return f"Error listing tasks: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def get_task(entry_id: str) -> str:
+    """Read the full details of a specific task.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the task.
+
+    Returns:
+        JSON object with full task details including body.
+    """
+    def _get(outlook, namespace, entry_id):
+        item = namespace.GetItemFromID(entry_id)
+        return json.dumps(format_task_full(item), indent=2, default=str)
+
+    try:
+        return await bridge.call(_get, entry_id)
+    except Exception as e:
+        return f"Error reading task: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def create_task(
+    subject: str,
+    body: str = "",
+    due_date: str = "",
+    importance: str = "normal",
+    reminder_minutes: int = 0,
+) -> str:
+    """Create a new task in Outlook.
+
+    Args:
+        subject: The task title.
+        body: Optional. Task description or notes.
+        due_date: Optional. Due date in ISO 8601 format (e.g. "2026-03-01").
+        importance: Optional. "low", "normal" (default), or "high".
+        reminder_minutes: Optional. Minutes before due date to remind.
+            Default 0 (no reminder).
+
+    Returns:
+        Confirmation with task subject and entry_id.
+    """
+    def _create(outlook, namespace, subject, body, due_date, importance,
+                reminder_minutes):
+        task = outlook.CreateItem(OL_TASK_ITEM)
+        task.Subject = subject
+        if body:
+            task.Body = body
+        if due_date:
+            task.DueDate = due_date
+        imp_map = {"low": 0, "normal": 1, "high": 2}
+        task.Importance = imp_map.get(importance.lower(), 1)
+        if reminder_minutes > 0:
+            task.ReminderSet = True
+            task.ReminderMinutesBeforeStart = reminder_minutes
+        else:
+            task.ReminderSet = False
+        task.Save()
+        return json.dumps({
+            "status": "created",
+            "subject": task.Subject,
+            "entry_id": task.EntryID,
+            "due_date": str(task.DueDate) if due_date else None,
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(
+            _create, subject, body, due_date, importance, reminder_minutes,
+        )
+    except Exception as e:
+        return f"Error creating task: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def complete_task(entry_id: str) -> str:
+    """Mark a task as complete.
+
+    Sets the task status to complete and percent to 100%.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the task.
+
+    Returns:
+        Confirmation with the task subject.
+    """
+    def _complete(outlook, namespace, entry_id):
+        item = namespace.GetItemFromID(entry_id)
+        item.Status = OL_TASK_COMPLETE
+        item.PercentComplete = 100
+        item.Save()
+        return f"Task completed: '{item.Subject}'"
+
+    try:
+        return await bridge.call(_complete, entry_id)
+    except Exception as e:
+        return f"Error completing task: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def delete_task(entry_id: str) -> str:
+    """Delete a task from Outlook.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the task to delete.
+
+    Returns:
+        Confirmation with the task subject.
+    """
+    def _delete(outlook, namespace, entry_id):
+        item = namespace.GetItemFromID(entry_id)
+        subject = item.Subject
+        item.Delete()
+        return f"Task deleted: '{subject}'"
+
+    try:
+        return await bridge.call(_delete, entry_id)
+    except Exception as e:
+        return f"Error deleting task: {format_com_error(e)}"
+
+
+# =====================================================================
+# ATTACHMENT TOOLS
+# =====================================================================
+
+@mcp.tool()
+async def list_attachments(entry_id: str) -> str:
+    """List all attachments on an email or calendar event.
+
+    Args:
+        entry_id: The EntryID of the email or event to check for attachments.
+
+    Returns:
+        JSON array of attachment objects with index, filename, and size.
+    """
+    def _list(outlook, namespace, entry_id):
+        item = namespace.GetItemFromID(entry_id)
+        results = []
+        for i in range(item.Attachments.Count):
+            att = item.Attachments.Item(i + 1)
+            results.append({
+                "index": i + 1,
+                "filename": att.FileName,
+                "size": att.Size,
+            })
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, entry_id)
+    except Exception as e:
+        return f"Error listing attachments: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def save_attachment(
+    entry_id: str,
+    attachment_index: int = 1,
+    save_directory: str = "",
+) -> str:
+    """Save an attachment from an email or event to disk.
+
+    Downloads the specified attachment to a local directory.
+
+    Args:
+        entry_id: The EntryID of the email or event containing the attachment.
+        attachment_index: Which attachment to save (1-based index). Default 1
+            (first attachment). Use list_attachments to see available indices.
+        save_directory: Directory to save the file to. Default: user's
+            Downloads folder.
+
+    Returns:
+        The full file path where the attachment was saved, or an error.
+    """
+    def _save(outlook, namespace, entry_id, attachment_index, save_directory):
+        item = namespace.GetItemFromID(entry_id)
+        if item.Attachments.Count < attachment_index:
+            return f"Error: Only {item.Attachments.Count} attachment(s), requested index {attachment_index}"
+
+        att = item.Attachments.Item(attachment_index)
+        if not save_directory:
+            save_directory = os.path.join(os.path.expanduser("~"), "Downloads")
+        os.makedirs(save_directory, exist_ok=True)
+        save_path = os.path.join(save_directory, att.FileName)
+        att.SaveAsFile(save_path)
+        return json.dumps({
+            "status": "saved",
+            "filename": att.FileName,
+            "path": save_path,
+            "size": att.Size,
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_save, entry_id, attachment_index, save_directory)
+    except Exception as e:
+        return f"Error saving attachment: {format_com_error(e)}"
+
+
+# =====================================================================
+# CATEGORY TOOLS
+# =====================================================================
+
+@mcp.tool()
+async def list_categories() -> str:
+    """List all available Outlook categories.
+
+    Returns the color categories configured in the user's Outlook profile.
+    These can be applied to emails, events, tasks, and other items.
+
+    Returns:
+        JSON array of category objects with name and color index.
+    """
+    def _list(outlook, namespace):
+        results = []
+        for i in range(namespace.Categories.Count):
+            cat = namespace.Categories.Item(i + 1)
+            results.append({"name": cat.Name, "color": cat.Color})
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list)
+    except Exception as e:
+        return f"Error listing categories: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def set_category(
+    entry_id: str,
+    categories: str,
+) -> str:
+    """Set categories on an email, event, or task.
+
+    Replaces any existing categories on the item. Use comma-separated
+    values for multiple categories.
+
+    Args:
+        entry_id: The EntryID of the item to categorize.
+        categories: Category name(s), comma-separated. Example:
+            "Important" or "Work, Follow-up". Use an empty string to
+            clear all categories.
+
+    Returns:
+        Confirmation with the item subject and applied categories.
+    """
+    def _set(outlook, namespace, entry_id, categories):
+        item = namespace.GetItemFromID(entry_id)
+        item.Categories = categories
+        item.Save()
+        return (
+            f"Categories set on '{item.Subject}': "
+            f"'{item.Categories or '(none)'}'"
+        )
+
+    try:
+        return await bridge.call(_set, entry_id, categories)
+    except Exception as e:
+        return f"Error setting categories: {format_com_error(e)}"
+
+
+# =====================================================================
+# RULES TOOLS
+# =====================================================================
+
+@mcp.tool()
+async def list_rules() -> str:
+    """List all mail rules in Outlook.
+
+    Returns the configured inbox rules with their names and enabled status.
+
+    Returns:
+        JSON array of rule objects with name, enabled status, and index.
+    """
+    def _list(outlook, namespace):
+        store = namespace.DefaultStore
+        rules = store.GetRules()
+        results = []
+        for i in range(rules.Count):
+            rule = rules.Item(i + 1)
+            results.append({
+                "index": i + 1,
+                "name": rule.Name,
+                "enabled": bool(rule.Enabled),
+            })
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list)
+    except Exception as e:
+        return f"Error listing rules: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def toggle_rule(
+    rule_name: str,
+    enabled: bool,
+) -> str:
+    """Enable or disable a mail rule by name.
+
+    Args:
+        rule_name: The exact name of the rule to toggle. Use list_rules
+            to see available rule names.
+        enabled: True to enable the rule, False to disable it.
+
+    Returns:
+        Confirmation with the rule name and new status.
+    """
+    def _toggle(outlook, namespace, rule_name, enabled):
+        store = namespace.DefaultStore
+        rules = store.GetRules()
+        for i in range(rules.Count):
+            rule = rules.Item(i + 1)
+            if rule.Name == rule_name:
+                rule.Enabled = enabled
+                rules.Save()
+                status = "enabled" if enabled else "disabled"
+                return f"Rule '{rule_name}' {status}"
+        return f"Error: Rule '{rule_name}' not found. Use list_rules to see available rules."
+
+    try:
+        return await bridge.call(_toggle, rule_name, enabled)
+    except Exception as e:
+        return f"Error toggling rule: {format_com_error(e)}"
+
+
+# =====================================================================
+# OUT OF OFFICE TOOLS
+# =====================================================================
+
+@mcp.tool()
+async def get_out_of_office() -> str:
+    """Check the current Out of Office (auto-reply) status.
+
+    Returns whether Out of Office is currently enabled.
+
+    Returns:
+        JSON object with the OOF status.
+    """
+    def _get(outlook, namespace):
+        store = namespace.DefaultStore
+        try:
+            prop_tag = "http://schemas.microsoft.com/mapi/proptag/0x661D000B"
+            oof_state = store.PropertyAccessor.GetProperty(prop_tag)
+            return json.dumps({
+                "out_of_office": bool(oof_state),
+                "status": "on" if oof_state else "off",
+            }, indent=2)
+        except Exception:
+            return json.dumps({
+                "out_of_office": None,
+                "status": "unknown",
+                "note": "Could not read OOF property. Check Outlook settings directly.",
+            }, indent=2)
+
+    try:
+        return await bridge.call(_get)
+    except Exception as e:
+        return f"Error checking OOF status: {format_com_error(e)}"
 
 
 # =====================================================================
