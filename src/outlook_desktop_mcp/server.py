@@ -14,11 +14,27 @@ import logging
 from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.com_bridge import OutlookBridge
+from datetime import datetime, timedelta
+
 from outlook_desktop_mcp.tools._folder_constants import (
     FOLDER_NAME_TO_ENUM,
     OL_MAIL_ITEM,
+    OL_APPOINTMENT_ITEM,
+    OL_FOLDER_CALENDAR,
+    OL_MEETING,
+    OL_MEETING_CANCELED,
+    OL_RESPONSE_TENTATIVE,
+    OL_RESPONSE_ACCEPTED,
+    OL_RESPONSE_DECLINED,
+    OL_REQUIRED,
+    OL_OPTIONAL,
 )
-from outlook_desktop_mcp.utils.formatting import format_email_summary, format_email_full
+from outlook_desktop_mcp.utils.formatting import (
+    format_email_summary,
+    format_email_full,
+    format_event_summary,
+    format_event_full,
+)
 from outlook_desktop_mcp.utils.errors import format_com_error
 
 # --- Logging (all to stderr, stdout is reserved for MCP JSON-RPC) ---
@@ -47,9 +63,10 @@ mcp = FastMCP(
         "Outlook (olk.exe) is NOT supported — only the classic OUTLOOK.EXE.\n\n"
         "AVAILABLE TOOL CATEGORIES:\n"
         "- Email: send, list, read, search, reply, mark read/unread, move\n"
+        "- Calendar: list events, create appointments/meetings, update, delete, "
+        "respond to invites, search events\n"
         "- Folders: list folder hierarchy with item counts\n\n"
         "PLANNED (not yet implemented):\n"
-        "- Calendar: events, meetings, scheduling\n"
         "- Contacts: address book lookups\n"
         "- Tasks: to-do items"
     ),
@@ -493,6 +510,464 @@ async def search_emails(
         return await bridge.call(_search, query, folder, count)
     except Exception as e:
         return f"Error searching emails: {format_com_error(e)}"
+
+
+# =====================================================================
+# CALENDAR TOOLS
+# =====================================================================
+
+
+# --- Helper: parse ISO date string ---
+
+def _parse_date(date_str: str) -> datetime:
+    """Parse ISO 8601 date string like '2026-02-25 14:00' or '2026-02-25T14:00:00'."""
+    return datetime.fromisoformat(date_str)
+
+
+# =====================================================================
+# TOOL 10: list_events
+# =====================================================================
+
+@mcp.tool()
+async def list_events(
+    start_date: str = "",
+    end_date: str = "",
+    count: int = 20,
+) -> str:
+    """List upcoming calendar events from Outlook.
+
+    Returns a JSON array of event summaries within a date range, sorted by
+    start time. Includes recurring event occurrences. Each summary has
+    entry_id, subject, start, end, duration, location, organizer, attendees,
+    and status info.
+
+    Use entry_id from results with get_event, update_event, delete_event,
+    or respond_to_meeting.
+
+    Args:
+        start_date: Start of date range in ISO 8601 format (e.g. "2026-02-25"
+            or "2026-02-25 09:00"). Default: now.
+        end_date: End of date range. Default: 7 days from start_date.
+        count: Maximum number of events to return. Default 20.
+
+    Returns:
+        JSON array of event summary objects.
+    """
+    def _list(outlook, namespace, start_date, end_date, count):
+        calendar = namespace.GetDefaultFolder(OL_FOLDER_CALENDAR)
+        items = calendar.Items
+
+        # CRITICAL ORDER: Sort BEFORE IncludeRecurrences BEFORE Restrict
+        items.Sort("[Start]")
+        items.IncludeRecurrences = True
+
+        start = _parse_date(start_date) if start_date else datetime.now()
+        end = _parse_date(end_date) if end_date else start + timedelta(days=7)
+
+        restrict = (
+            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
+            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+        )
+        filtered = items.Restrict(restrict)
+
+        results = []
+        n = 0
+        for item in filtered:
+            n += 1
+            try:
+                results.append(format_event_summary(item))
+            except Exception:
+                continue
+            if n >= count:
+                break
+
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, start_date, end_date, count)
+    except Exception as e:
+        return f"Error listing events: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 11: get_event
+# =====================================================================
+
+@mcp.tool()
+async def get_event(entry_id: str) -> str:
+    """Read the full details of a specific calendar event.
+
+    Retrieves complete event information including body/description,
+    attendees, recurrence status, reminders, and response status.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the event. Get this from
+            list_events or search_events results.
+
+    Returns:
+        JSON object with full event details.
+    """
+    def _get(outlook, namespace, entry_id):
+        item = namespace.GetItemFromID(entry_id)
+        return json.dumps(format_event_full(item), indent=2, default=str)
+
+    try:
+        return await bridge.call(_get, entry_id)
+    except Exception as e:
+        return f"Error reading event: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 12: create_event
+# =====================================================================
+
+@mcp.tool()
+async def create_event(
+    subject: str,
+    start: str,
+    end: str,
+    location: str = "",
+    body: str = "",
+    all_day: bool = False,
+    reminder_minutes: int = 15,
+) -> str:
+    """Create a personal calendar appointment (no attendees).
+
+    Creates and saves an appointment on the user's calendar. This is a
+    personal event — no meeting invitations are sent. Use create_meeting
+    instead if you need to invite attendees.
+
+    Args:
+        subject: The event title.
+        start: Start time in ISO 8601 format. Examples: "2026-02-25 14:00",
+            "2026-02-25T14:00:00". For all-day events, use just the date:
+            "2026-02-25".
+        end: End time in ISO 8601 format. For all-day events, use the next
+            day: "2026-02-26".
+        location: Optional. Event location (e.g. "Conference Room A",
+            "Microsoft Teams Meeting").
+        body: Optional. Description or notes for the event.
+        all_day: If true, creates an all-day event. Default false.
+        reminder_minutes: Minutes before the event to show a reminder.
+            Default 15. Set to 0 to disable reminder.
+
+    Returns:
+        Confirmation with event subject and entry_id, or an error.
+    """
+    def _create(outlook, namespace, subject, start, end, location, body,
+                all_day, reminder_minutes):
+        appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
+        appt.Subject = subject
+        appt.Start = start
+        appt.End = end
+        if location:
+            appt.Location = location
+        if body:
+            appt.Body = body
+        appt.AllDayEvent = all_day
+        if reminder_minutes > 0:
+            appt.ReminderSet = True
+            appt.ReminderMinutesBeforeStart = reminder_minutes
+        else:
+            appt.ReminderSet = False
+        appt.Save()
+        return json.dumps({
+            "status": "created",
+            "subject": appt.Subject,
+            "start": str(appt.Start),
+            "end": str(appt.End),
+            "entry_id": appt.EntryID,
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(
+            _create, subject, start, end, location, body, all_day,
+            reminder_minutes,
+        )
+    except Exception as e:
+        return f"Error creating event: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 13: create_meeting
+# =====================================================================
+
+@mcp.tool()
+async def create_meeting(
+    subject: str,
+    start: str,
+    end: str,
+    required_attendees: str,
+    location: str = "",
+    body: str = "",
+    optional_attendees: str = "",
+) -> str:
+    """Create a meeting and send invitations to attendees.
+
+    Creates a calendar meeting and immediately sends meeting requests to
+    all specified attendees. The meeting will appear on the organizer's
+    calendar and attendees will receive an invitation they can accept,
+    decline, or tentatively accept.
+
+    Args:
+        subject: The meeting title.
+        start: Start time in ISO 8601 format (e.g. "2026-02-25 14:00").
+        end: End time in ISO 8601 format (e.g. "2026-02-25 15:00").
+        required_attendees: Required attendee email addresses, separated by
+            semicolons. Example: "alice@example.com; bob@example.com"
+        location: Optional. Meeting location (e.g. "Teams", "Room 301").
+        body: Optional. Meeting description or agenda.
+        optional_attendees: Optional. Optional attendee emails, separated
+            by semicolons.
+
+    Returns:
+        Confirmation that the meeting was created and invitations sent.
+    """
+    def _create(outlook, namespace, subject, start, end, required_attendees,
+                location, body, optional_attendees):
+        appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
+        appt.Subject = subject
+        appt.Start = start
+        appt.End = end
+        appt.MeetingStatus = OL_MEETING
+        if location:
+            appt.Location = location
+        if body:
+            appt.Body = body
+
+        for addr in required_attendees.split(";"):
+            addr = addr.strip()
+            if addr:
+                recip = appt.Recipients.Add(addr)
+                recip.Type = OL_REQUIRED
+
+        if optional_attendees:
+            for addr in optional_attendees.split(";"):
+                addr = addr.strip()
+                if addr:
+                    recip = appt.Recipients.Add(addr)
+                    recip.Type = OL_OPTIONAL
+
+        appt.Recipients.ResolveAll()
+        appt.Send()
+        return (
+            f"Meeting '{subject}' created and invitations sent to "
+            f"{required_attendees}"
+        )
+
+    try:
+        return await bridge.call(
+            _create, subject, start, end, required_attendees, location, body,
+            optional_attendees,
+        )
+    except Exception as e:
+        return f"Error creating meeting: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 14: update_event
+# =====================================================================
+
+@mcp.tool()
+async def update_event(
+    entry_id: str,
+    subject: str = "",
+    start: str = "",
+    end: str = "",
+    location: str = "",
+    body: str = "",
+) -> str:
+    """Update an existing calendar event.
+
+    Modifies properties of an appointment or meeting. Only the fields you
+    provide will be updated — omitted fields remain unchanged. For meetings
+    you organize, attendees will receive an update notification.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the event to update.
+        subject: Optional. New event title.
+        start: Optional. New start time in ISO 8601 format.
+        end: Optional. New end time in ISO 8601 format.
+        location: Optional. New location.
+        body: Optional. New description/notes.
+
+    Returns:
+        Confirmation with updated event details, or an error.
+    """
+    def _update(outlook, namespace, entry_id, subject, start, end, location, body):
+        item = namespace.GetItemFromID(entry_id)
+        if subject:
+            item.Subject = subject
+        if start:
+            item.Start = start
+        if end:
+            item.End = end
+        if location:
+            item.Location = location
+        if body:
+            item.Body = body
+        item.Save()
+        return json.dumps({
+            "status": "updated",
+            "subject": item.Subject,
+            "start": str(item.Start),
+            "end": str(item.End),
+            "location": item.Location or "",
+            "entry_id": item.EntryID,
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(
+            _update, entry_id, subject, start, end, location, body,
+        )
+    except Exception as e:
+        return f"Error updating event: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 15: delete_event
+# =====================================================================
+
+@mcp.tool()
+async def delete_event(entry_id: str) -> str:
+    """Delete a calendar event or cancel a meeting.
+
+    For personal appointments, the event is simply deleted. For meetings
+    you organized, this cancels the meeting and sends cancellation notices
+    to all attendees. For meetings you received, this declines and removes
+    the event from your calendar.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the event to delete/cancel.
+
+    Returns:
+        Confirmation with the event subject, or an error.
+    """
+    def _delete(outlook, namespace, entry_id):
+        item = namespace.GetItemFromID(entry_id)
+        subject = item.Subject
+        meeting_status = item.MeetingStatus
+
+        # If this is a meeting we organized, cancel it (sends notices)
+        if meeting_status == OL_MEETING:
+            item.MeetingStatus = OL_MEETING_CANCELED
+            item.Send()
+            return f"Meeting canceled: '{subject}' (cancellation sent to attendees)"
+
+        # Otherwise just delete
+        item.Delete()
+        return f"Event deleted: '{subject}'"
+
+    try:
+        return await bridge.call(_delete, entry_id)
+    except Exception as e:
+        return f"Error deleting event: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 16: respond_to_meeting
+# =====================================================================
+
+@mcp.tool()
+async def respond_to_meeting(
+    entry_id: str,
+    response: str,
+) -> str:
+    """Respond to a meeting invitation (accept, decline, or tentative).
+
+    Sends your response to the meeting organizer. The meeting will be
+    added to (or updated on) your calendar accordingly.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the meeting to respond to.
+            Get this from list_events or search_events.
+        response: Your response. Must be one of: "accept", "decline",
+            or "tentative".
+
+    Returns:
+        Confirmation of your response, or an error.
+    """
+    def _respond(outlook, namespace, entry_id, response):
+        response_map = {
+            "accept": OL_RESPONSE_ACCEPTED,
+            "decline": OL_RESPONSE_DECLINED,
+            "tentative": OL_RESPONSE_TENTATIVE,
+        }
+        response_lower = response.lower().strip()
+        if response_lower not in response_map:
+            return f"Error: response must be 'accept', 'decline', or 'tentative'. Got: '{response}'"
+
+        item = namespace.GetItemFromID(entry_id)
+        subject = item.Subject
+        response_item = item.Respond(response_map[response_lower])
+        response_item.Send()
+        return f"Responded '{response_lower}' to meeting: '{subject}'"
+
+    try:
+        return await bridge.call(_respond, entry_id, response)
+    except Exception as e:
+        return f"Error responding to meeting: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 17: search_events
+# =====================================================================
+
+@mcp.tool()
+async def search_events(
+    query: str,
+    start_date: str = "",
+    end_date: str = "",
+    count: int = 10,
+) -> str:
+    """Search for calendar events by keyword.
+
+    Searches event subjects within a date range. Results are sorted by
+    start time. Includes recurring event occurrences.
+
+    Args:
+        query: The search term (case-insensitive substring match on subject).
+            Examples: "standup", "review", "1:1".
+        start_date: Start of search range in ISO 8601 format. Default: 30
+            days ago.
+        end_date: End of search range. Default: 30 days from now.
+        count: Maximum results to return. Default 10.
+
+    Returns:
+        JSON array of matching event summaries.
+    """
+    def _search(outlook, namespace, query, start_date, end_date, count):
+        calendar = namespace.GetDefaultFolder(OL_FOLDER_CALENDAR)
+        items = calendar.Items
+        items.Sort("[Start]")
+        items.IncludeRecurrences = True
+
+        start = _parse_date(start_date) if start_date else datetime.now() - timedelta(days=30)
+        end = _parse_date(end_date) if end_date else datetime.now() + timedelta(days=30)
+
+        restrict = (
+            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
+            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+        )
+        filtered = items.Restrict(restrict)
+
+        query_lower = query.lower()
+        results = []
+        for item in filtered:
+            if query_lower in (item.Subject or "").lower():
+                try:
+                    results.append(format_event_summary(item))
+                except Exception:
+                    continue
+                if len(results) >= count:
+                    break
+
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_search, query, start_date, end_date, count)
+    except Exception as e:
+        return f"Error searching events: {format_com_error(e)}"
 
 
 # =====================================================================

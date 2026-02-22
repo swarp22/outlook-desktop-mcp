@@ -1,5 +1,11 @@
-"""Helpers for extracting and formatting Outlook MailItem data."""
+"""Helpers for extracting and formatting Outlook item data."""
 import re
+
+from outlook_desktop_mcp.tools._folder_constants import (
+    BUSY_STATUS_NAMES,
+    MEETING_STATUS_NAMES,
+    RESPONSE_NAMES,
+)
 
 
 def truncate(text: str, max_length: int = 2000) -> str:
@@ -34,4 +40,39 @@ def format_email_full(item, body_max_length: int = 5000) -> dict:
     result["to"] = item.To or ""
     result["cc"] = item.CC or ""
     result["body"] = truncate(item.Body or "", body_max_length)
+    return result
+
+
+# --- Calendar formatting ---
+
+
+def format_event_summary(item) -> dict:
+    """Extract key fields from an Outlook AppointmentItem."""
+    return {
+        "entry_id": item.EntryID,
+        "subject": item.Subject or "(no subject)",
+        "start": str(item.Start),
+        "end": str(item.End),
+        "duration": item.Duration,
+        "location": item.Location or "",
+        "organizer": item.Organizer or "",
+        "is_recurring": bool(item.IsRecurring),
+        "all_day": bool(item.AllDayEvent),
+        "busy_status": BUSY_STATUS_NAMES.get(item.BusyStatus, "unknown"),
+        "meeting_status": MEETING_STATUS_NAMES.get(item.MeetingStatus, "unknown"),
+        "required_attendees": item.RequiredAttendees or "",
+        "optional_attendees": item.OptionalAttendees or "",
+    }
+
+
+def format_event_full(item, body_max_length: int = 5000) -> dict:
+    """Full event details including body."""
+    result = format_event_summary(item)
+    result["body"] = truncate(item.Body or "", body_max_length)
+    result["reminder_set"] = bool(item.ReminderSet)
+    result["reminder_minutes"] = (
+        item.ReminderMinutesBeforeStart if item.ReminderSet else None
+    )
+    result["categories"] = item.Categories or ""
+    result["response_status"] = RESPONSE_NAMES.get(item.ResponseStatus, "unknown")
     return result
