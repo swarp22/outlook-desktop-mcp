@@ -5,6 +5,8 @@ from outlook_desktop_mcp.tools._folder_constants import (
     BUSY_STATUS_NAMES,
     MEETING_STATUS_NAMES,
     RESPONSE_NAMES,
+    TASK_STATUS_NAMES,
+    IMPORTANCE_NAMES,
 )
 
 
@@ -75,4 +77,34 @@ def format_event_full(item, body_max_length: int = 5000) -> dict:
     )
     result["categories"] = item.Categories or ""
     result["response_status"] = RESPONSE_NAMES.get(item.ResponseStatus, "unknown")
+    return result
+
+
+# --- Task formatting ---
+
+
+def format_task_summary(item) -> dict:
+    """Extract key fields from an Outlook TaskItem."""
+    return {
+        "entry_id": item.EntryID,
+        "subject": item.Subject or "(no subject)",
+        "status": TASK_STATUS_NAMES.get(item.Status, "unknown"),
+        "percent_complete": item.PercentComplete,
+        "due_date": str(item.DueDate) if str(item.DueDate) != "01/01/4501" else None,
+        "start_date": str(item.StartDate) if str(item.StartDate) != "01/01/4501" else None,
+        "importance": IMPORTANCE_NAMES.get(item.Importance, "normal"),
+        "complete": bool(item.Complete),
+        "categories": item.Categories or "",
+        "owner": item.Owner or "",
+    }
+
+
+def format_task_full(item, body_max_length: int = 5000) -> dict:
+    """Full task details including body."""
+    result = format_task_summary(item)
+    result["body"] = truncate(item.Body or "", body_max_length)
+    result["reminder_set"] = bool(item.ReminderSet)
+    result["date_completed"] = (
+        str(item.DateCompleted) if item.Complete else None
+    )
     return result
