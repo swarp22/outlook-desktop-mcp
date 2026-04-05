@@ -4,9 +4,11 @@
 [![Python](https://img.shields.io/pypi/pyversions/outlook-desktop-mcp)](https://pypi.org/project/outlook-desktop-mcp/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)]()
 
-**Turn your running Outlook Desktop into an MCP server.** No Microsoft Graph API, no Entra app registration, no OAuth tokens — just your local Outlook and the authentication you already have.
+**Turn your running Outlook Desktop into a READ-ONLY MCP server.** No Microsoft Graph API, no Entra app registration, no OAuth tokens — just your local Outlook and the authentication you already have.
 
-Any MCP client (Claude Code, Claude Desktop, etc.) can then send emails, manage your calendar, create tasks, handle attachments, and more — all through your existing Outlook session.
+Any MCP client (Claude Code, Claude Desktop, etc.) can then read emails, browse your calendar, view tasks, and list attachments — all through your existing Outlook session.
+
+> **Note:** This is a read-only fork of [Aanerud/outlook-desktop-mcp](https://github.com/Aanerud/outlook-desktop-mcp). All tools that create, modify, or delete Outlook items have been removed.
 
 ## Quick Start
 
@@ -38,8 +40,9 @@ When the server starts, it checks which operating system it is running on and ta
               ┌───────┴────────┐    ┌────────┴────────┐
               │  server.py     │    │  server_mac.py   │
               │  COM Bridge    │    │  AppleScript     │
-              │  (29 tools)    │    │  Bridge          │
-              │                │    │  (22 tools)      │
+              │  (15 tools)    │    │  Bridge          │
+              │  READ-ONLY     │    │  (11 tools)      │
+              │                │    │  READ-ONLY       │
               └───────┬────────┘    └────────┬─────────┘
                       |                      |
               OUTLOOK.EXE via         Microsoft Outlook
@@ -93,14 +96,9 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 
 | Tool | Windows | macOS | Description |
 |------|:-------:|:-----:|-------------|
-| `send_email` | yes | yes | Send an email with To/CC/BCC, plain text or HTML body |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
 | `search_emails` | yes | yes | Full-text search across email subjects and bodies |
-| `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread |
-| `mark_as_read` | yes | yes | Mark a specific email as read |
-| `mark_as_unread` | yes | yes | Mark a specific email as unread |
-| `move_email` | yes | yes | Move an email to Archive, Trash, or any folder |
 | `list_folders` | yes | yes | Browse the folder hierarchy with item counts |
 
 ### Calendar
@@ -109,11 +107,6 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 |------|:-------:|:-----:|-------------|
 | `list_events` | yes | yes | List upcoming events within a date range |
 | `get_event` | yes | yes | Read full event details by entry ID |
-| `create_event` | yes | yes | Create a personal calendar appointment |
-| `create_meeting` | yes | yes | Create a meeting and send invitations to attendees |
-| `update_event` | yes | yes | Modify an existing event's subject, time, location, etc. |
-| `delete_event` | yes | yes | Delete an appointment or cancel a meeting |
-| `respond_to_meeting` | yes | — | Accept, decline, or tentatively accept a meeting invite |
 | `search_events` | yes | yes | Search calendar events by keyword within a date range |
 
 ### Tasks
@@ -122,9 +115,6 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 |------|:-------:|:-----:|-------------|
 | `list_tasks` | yes | yes | List pending or completed tasks, sorted by due date |
 | `get_task` | yes | yes | Read full task details including body and completion status |
-| `create_task` | yes | yes | Create a new task with subject, due date, importance |
-| `complete_task` | yes | yes | Mark a task as complete |
-| `delete_task` | yes | yes | Remove a task |
 
 ### Attachments
 
@@ -133,19 +123,16 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `list_attachments` | yes | yes | List all attachments on an email or calendar event |
 | `save_attachment` | yes | yes | Download an attachment to a local directory |
 
-### Categories, Rules, Out of Office (Windows only)
-
-These tools rely on COM-specific APIs (MAPI property accessors, the Rules object model, and the Categories collection) that Outlook for Mac does not expose through AppleScript.
+### Categories, Rules, Out of Office (Windows only, read-only)
 
 | Tool | Windows | macOS | Description |
 |------|:-------:|:-----:|-------------|
+| `list_accounts` | yes | — | List all configured Outlook accounts |
 | `list_categories` | yes | — | List all available color categories in Outlook |
-| `set_category` | yes | — | Set or clear categories on any email, event, or task |
 | `list_rules` | yes | — | List all mail rules with enabled/disabled status |
-| `toggle_rule` | yes | — | Enable or disable a mail rule by name |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |
 
-**Total: 29 tools on Windows, 22 tools on macOS.**
+**Total: 15 read-only tools on Windows, 11 read-only tools on macOS.**
 
 ## Architecture Details
 
@@ -226,16 +213,14 @@ Once registered, just talk to Claude naturally:
 
 - *"Show me my 10 most recent inbox emails"*
 - *"Read the email from Taylor about MLADS"*
-- *"Send an email to alice@example.com about the project update"*
 - *"What's on my calendar this week?"*
-- *"Create a meeting with bob@example.com tomorrow at 2pm for 30 minutes"*
+- *"Search for emails about the quarterly report"*
 - *"Save the attachment from that email to my Downloads folder"*
-- *"Create a task to review the quarterly report, due Friday, high importance"*
-- *"Mark that email as read and move it to archive"*
+- *"What tasks are due this week?"*
 
 Windows-only examples:
 
-- *"What categories do I have? Set this email to 'Follow-up'"*
+- *"What categories do I have?"*
 - *"List my mail rules"*
 - *"Am I set as Out of Office?"*
 
@@ -257,8 +242,8 @@ Windows-only examples:
 outlook-desktop-mcp/
   src/outlook_desktop_mcp/
     entrypoint.py            # Platform detection → routes to correct server
-    server.py                # Windows MCP server (29 tools, COM automation)
-    server_mac.py            # macOS MCP server (22 tools, AppleScript)
+    server.py                # Windows MCP server (15 read-only tools, COM automation)
+    server_mac.py            # macOS MCP server (11 read-only tools, AppleScript)
     com_bridge.py            # Async-to-COM threading bridge (Windows)
     applescript_bridge.py    # Async osascript execution (macOS)
     tools/
