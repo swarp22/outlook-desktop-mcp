@@ -560,33 +560,49 @@ async def search_emails(
     else:
         whose_clause = ""
 
-    # Post-filtering needed for sender, body, or date
-    needs_post_filter = bool(sender or body or start_date or end_date)
-    prefetch_count = min(count * 10, 200) if needs_post_filter else count
+    # Sender/body filtering happens inside the AppleScript loop.
+    # This avoids transferring hundreds of non-matching messages and
+    # prevents timeouts when no whose clause narrows the result set.
+    needs_loop_filter = bool(sender or body)
+    scan_limit = min(count * 20, 500) if needs_loop_filter else count
 
-    # Only fetch body text when body search is requested (expensive)
+    # Build conditional filter blocks for the AppleScript repeat loop
+    sender_filter_block = ""
+    if sender:
+        safe_sender = escape(sender)
+        sender_filter_block = f'''
+        if isMatch then
+            if msender does not contain "{safe_sender}" and msenderName does not contain "{safe_sender}" then
+                set isMatch to false
+            end if
+        end if'''
+
+    body_filter_block = ""
     if body:
-        body_fetch = '''
-        set mbody to ""
-        try
-            set mbody to plain text content of m
-        end try'''
-        body_output = f' & "{DELIM}" & mbody'
-    else:
-        body_fetch = ""
-        body_output = ""
+        safe_body = escape(body)
+        body_filter_block = f'''
+        if isMatch then
+            set mbody to ""
+            try
+                set mbody to plain text content of m
+            end try
+            if mbody does not contain "{safe_body}" then
+                set isMatch to false
+            end if
+        end if'''
 
     script = f'''tell application "Microsoft Outlook"
     set folderRef to {folder_ref}
-    set matchMsgs to messages of folderRef{whose_clause}
-    set msgCount to count of matchMsgs
-    set maxCount to {prefetch_count}
-    if msgCount < maxCount then set maxCount to msgCount
+    set allMsgs to messages of folderRef{whose_clause}
+    set msgCount to count of allMsgs
+    set maxScan to {scan_limit}
+    if msgCount < maxScan then set maxScan to msgCount
+    set matchCount to 0
+    set maxResults to {count}
     set output to ""
-    repeat with i from 1 to maxCount
-        set m to item i of matchMsgs
-        set mid to id of m
-        set msubject to subject of m
+    repeat with i from 1 to maxScan
+        if matchCount \u2265 maxResults then exit repeat
+        set m to item i of allMsgs
         set msender to ""
         try
             set msender to address of sender of m
@@ -595,25 +611,33 @@ async def search_emails(
         try
             set msenderName to name of sender of m
         end try
-        set mtime to time received of m as string
-        set misread to is read of m
-        set mattcount to 0
-        try
-            set mattcount to count of attachments of m
-        end try{body_fetch}
-        set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text){body_output} & "{RECORD_DELIM}"
+        set isMatch to true{sender_filter_block}{body_filter_block}
+        if isMatch then
+            set matchCount to matchCount + 1
+            set mid to id of m
+            set msubject to subject of m
+            set mtime to time received of m as string
+            set misread to is read of m
+            set mattcount to 0
+            try
+                set mattcount to count of attachments of m
+            end try
+            set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
+        end if
     end repeat
     return output
 end tell'''
 
+    # Sender/body loop filtering may need more time for large folders
+    script_timeout = 60 if needs_loop_filter else 30
+
     try:
-        raw = await bridge.run(script)
+        raw = await bridge.run(script, timeout=script_timeout)
         if not raw:
             return json.dumps([])
 
-        # Prepare post-filter values
-        sender_lower = sender.lower() if sender else ""
-        body_lower = body.lower() if body else ""
+        # Date filtering remains in Python (AppleScript date comparison
+        # is locale-dependent and unreliable)
         start_dt = datetime.fromisoformat(start_date) if start_date else None
         end_dt = datetime.fromisoformat(end_date) if end_date else None
 
@@ -626,26 +650,7 @@ end tell'''
             if len(parts) < 7:
                 continue
 
-            entry_id = parts[0].strip()
-            subject = parts[1].strip() or "(no subject)"
-            sender_addr = parts[2].strip()
-            sender_name = parts[3].strip()
             received_time = _clean(parts[4])
-            is_read = parts[5].strip()
-            att_count = int(parts[6].strip()) if parts[6].strip().isdigit() else 0
-            # Body is the last field — join remaining parts in case body
-            # itself contained the delimiter
-            msg_body = DELIM.join(parts[7:]) if body and len(parts) > 7 else ""
-
-            # Post-filter: sender (name or address)
-            if sender_lower:
-                if (sender_lower not in sender_addr.lower()
-                        and sender_lower not in sender_name.lower()):
-                    continue
-
-            # Post-filter: body
-            if body_lower and body_lower not in msg_body.lower():
-                continue
 
             # Post-filter: date range
             if start_dt or end_dt:
@@ -659,19 +664,17 @@ end tell'''
                 if end_dt and msg_dt > end_dt:
                     continue
 
+            att_count = int(parts[6].strip()) if parts[6].strip().isdigit() else 0
             results.append({
-                "entry_id": entry_id,
-                "subject": subject,
-                "sender": sender_addr,
-                "sender_name": sender_name,
+                "entry_id": parts[0].strip(),
+                "subject": parts[1].strip() or "(no subject)",
+                "sender": parts[2].strip(),
+                "sender_name": parts[3].strip(),
                 "received_time": received_time,
-                "unread": is_read.lower() != "true",
+                "unread": parts[5].strip().lower() != "true",
                 "has_attachments": att_count > 0,
                 "attachment_count": att_count,
             })
-
-            if len(results) >= count:
-                break
 
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
