@@ -170,6 +170,8 @@ Each tool constructs a single AppleScript that fetches all needed data in one `o
 - Entry IDs on macOS are **numeric** (e.g. `42`), not hex strings. They identify items within their folder context.
 - Folder references use AppleScript's **locale-independent keywords** (`inbox`, `sent items`, `drafts`, `deleted items`) rather than localized folder names.
 - Search uses a two-stage approach: AppleScript's `whose` clause pre-filters by subject, then sender and body are checked per-message inside the AppleScript loop (avoiding large data transfers). Date range filtering runs in Python. Body text is only fetched when explicitly searched (to avoid overhead). The script timeout increases to 60s for loop-filtered searches.
+- Sender information is extracted from the raw MIME `From:` header via `source of m`, because Exchange/O365 accounts return empty strings for `address of sender` and `name of sender`. The `From:` header is parsed in Python into display name and email address.
+- Attachments are saved using HFS file specifiers (`file "Macintosh HD:Users:..."`) because Outlook for Mac's `save` command does not accept POSIX path strings for new files.
 - User input is escaped for safe embedding in AppleScript strings to prevent script injection.
 
 ## Install from Source
