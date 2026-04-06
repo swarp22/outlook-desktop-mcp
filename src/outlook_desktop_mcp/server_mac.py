@@ -1147,18 +1147,17 @@ async def save_attachment(
     if attCount < {attachment_index} then return "ERROR:Only " & attCount & " attachment(s)"
     set a to item {attachment_index} of attList
     set aname to name of a
-    set savePath to "{safe_dir}/" & aname
-    save a in savePath
-    return aname & "{DELIM}" & savePath
+    set hfsDir to (POSIX file "{safe_dir}") as text
+    save a in file (hfsDir & ":" & aname)
+    return aname
 end tell'''
 
     try:
-        raw = await bridge.run(script)
+        raw = await bridge.run(script, timeout=60)
         if raw.startswith("ERROR:"):
             return raw
 
-        parts = raw.split(DELIM)
-        filename = parts[0].strip() if len(parts) > 0 else "unknown"
+        filename = raw.strip()
         save_path = os.path.join(save_directory, filename)
         result = {
             "status": "saved",
