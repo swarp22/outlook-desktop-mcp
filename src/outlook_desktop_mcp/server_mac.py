@@ -91,12 +91,6 @@ APPLESCRIPT_SENDER_BLOCK = '''
                 set sStr to (sender of m) as text
                 if sStr is not "missing value" then set msenderName to sStr
             end try
-        end if
-        if msender is "" then
-            try
-                set rawFrom to content of header "From" of m
-                set msender to rawFrom
-            end try
         end if'''
 
 
