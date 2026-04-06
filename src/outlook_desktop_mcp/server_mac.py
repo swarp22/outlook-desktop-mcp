@@ -1138,22 +1138,8 @@ async def save_attachment(
         save_directory = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(save_directory, exist_ok=True)
 
-    # Use POSIX path for AppleScript
-    save_dir_posix = save_directory
+    safe_dir = escape(save_directory)
 
-    script = f'''tell application "Microsoft Outlook"
-    set m to message id {entry_id}
-    set attList to attachments of m
-    set attCount to count of attList
-    if attCount < {attachment_index} then return "ERROR:Only " & attCount & " attachment(s), requested index {attachment_index}"
-    set a to item {attachment_index} of attList
-    set aname to name of a
-    set savePath to POSIX file "{escape(save_dir_posix)}/{escape("__PLACEHOLDER__")}"
-    save a in file ((POSIX path of (POSIX file "{escape(save_dir_posix)}")) & aname)
-    return aname
-end tell'''
-
-    # Simpler approach: save to known path
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set attList to attachments of m
@@ -1161,7 +1147,7 @@ end tell'''
     if attCount < {attachment_index} then return "ERROR:Only " & attCount & " attachment(s)"
     set a to item {attachment_index} of attList
     set aname to name of a
-    set savePath to "{escape(save_dir_posix)}/" & aname
+    set savePath to "{safe_dir}/" & aname
     save a in savePath
     return aname & "{DELIM}" & savePath
 end tell'''
