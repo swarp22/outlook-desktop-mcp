@@ -70,6 +70,36 @@ def _truncate(text: str, max_length: int = 5000) -> str:
     return text[:max_length] + "\n... [truncated]"
 
 
+# AppleScript block to extract sender address and name with Exchange fallbacks.
+# Exchange/O365 senders are often opaque objects where direct property access
+# (address of sender, name of sender) silently fails. We try multiple approaches:
+#   1. Direct property access (works for SMTP senders)
+#   2. String coercion of the sender object (often returns display name)
+#   3. Extracting from the "From" content header as last resort
+# Expects variable `m` (message) to be set. Sets `msender` and `msenderName`.
+APPLESCRIPT_SENDER_BLOCK = '''
+        set msender to ""
+        set msenderName to ""
+        try
+            set msender to address of sender of m
+        end try
+        try
+            set msenderName to name of sender of m
+        end try
+        if msender is "" and msenderName is "" then
+            try
+                set sStr to (sender of m) as text
+                if sStr is not "missing value" then set msenderName to sStr
+            end try
+        end if
+        if msender is "" then
+            try
+                set rawFrom to content of header "From" of m
+                set msender to rawFrom
+            end try
+        end if'''
+
+
 def _clean(value: str) -> str:
     """Replace AppleScript's 'missing value' with empty string."""
     v = value.strip()
@@ -253,15 +283,7 @@ async def list_emails(
     repeat with i from 1 to maxCount
         set m to item i of allMsgs
         set mid to id of m
-        set msubject to subject of m
-        set msender to ""
-        try
-            set msender to address of sender of m
-        end try
-        set msenderName to ""
-        try
-            set msenderName to name of sender of m
-        end try
+        set msubject to subject of m{APPLESCRIPT_SENDER_BLOCK}
         set mtime to time received of m as string
         set misread to is read of m
         set mattcount to 0
@@ -344,15 +366,7 @@ async def read_email(
         script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set mid to id of m
-    set msubject to subject of m
-    set msender to ""
-    try
-        set msender to address of sender of m
-    end try
-    set msenderName to ""
-    try
-        set msenderName to name of sender of m
-    end try
+    set msubject to subject of m{APPLESCRIPT_SENDER_BLOCK}
     set mtime to time received of m as string
     set misread to is read of m
     set mattcount to 0
@@ -388,15 +402,7 @@ end tell'''
     if (count of matchMsgs) = 0 then return "NOT_FOUND"
     set m to item 1 of matchMsgs
     set mid to id of m
-    set msubject to subject of m
-    set msender to ""
-    try
-        set msender to address of sender of m
-    end try
-    set msenderName to ""
-    try
-        set msenderName to name of sender of m
-    end try
+    set msubject to subject of m{APPLESCRIPT_SENDER_BLOCK}
     set mtime to time received of m as string
     set misread to is read of m
     set mattcount to 0
@@ -602,15 +608,7 @@ async def search_emails(
     set output to ""
     repeat with i from 1 to maxScan
         if matchCount \u2265 maxResults then exit repeat
-        set m to item i of allMsgs
-        set msender to ""
-        try
-            set msender to address of sender of m
-        end try
-        set msenderName to ""
-        try
-            set msenderName to name of sender of m
-        end try
+        set m to item i of allMsgs{APPLESCRIPT_SENDER_BLOCK}
         set isMatch to true{sender_filter_block}{body_filter_block}
         if isMatch then
             set matchCount to matchCount + 1
