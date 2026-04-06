@@ -169,7 +169,7 @@ Each tool constructs a single AppleScript that fetches all needed data in one `o
 
 - Entry IDs on macOS are **numeric** (e.g. `42`), not hex strings. They identify items within their folder context.
 - Folder references use AppleScript's **locale-independent keywords** (`inbox`, `sent items`, `drafts`, `deleted items`) rather than localized folder names.
-- Search uses a two-stage approach: AppleScript's `whose` clause pre-filters by subject, then Python post-filters by sender, body text, and date range. Body text is only fetched when explicitly searched (to avoid overhead).
+- Search uses a two-stage approach: AppleScript's `whose` clause pre-filters by subject, then sender and body are checked per-message inside the AppleScript loop (avoiding large data transfers). Date range filtering runs in Python. Body text is only fetched when explicitly searched (to avoid overhead). The script timeout increases to 60s for loop-filtered searches.
 - User input is escaped for safe embedding in AppleScript strings to prevent script injection.
 
 ## Install from Source
