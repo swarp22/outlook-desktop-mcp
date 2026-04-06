@@ -18,6 +18,7 @@ from mcp.server.fastmcp import FastMCP
 from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge
 from outlook_desktop_mcp.utils.applescript_helpers import (
     escape,
+    parse_date,
     resolve_folder_ref,
     DELIM,
     RECORD_DELIM,
@@ -513,33 +514,73 @@ end tell'''
 
 @mcp.tool()
 async def search_emails(
-    query: str,
+    query: str = "",
+    sender: str = "",
+    body: str = "",
     folder: str = "inbox",
     count: int = 10,
+    start_date: str = "",
+    end_date: str = "",
 ) -> str:
     """Search for emails in Outlook using text search.
 
-    Searches email subjects using Outlook's AppleScript filtering.
-    Results include entry_id for further operations.
+    Searches across subject, sender, and/or body text. All provided
+    criteria are combined with AND logic. At least one of query, sender,
+    or body must be provided.
 
     Args:
-        query: The search term (case-insensitive substring match on subject).
+        query: Search term for email subjects (case-insensitive substring).
             Examples: "budget report", "meeting notes", "quarterly".
+        sender: Search term for sender name or email address
+            (case-insensitive substring).
+            Examples: "mueller", "info@example.com", "Microsoft".
+        body: Search term for the email body text (case-insensitive
+            substring). Note: body search fetches message content and
+            may be slower for large folders.
         folder: Folder to search in. Default "inbox". Supports same
             names as list_emails.
         count: Maximum results to return. Default 10.
+        start_date: Optional. Only return emails received on or after
+            this date. ISO 8601 format (e.g. "2026-03-10").
+        end_date: Optional. Only return emails received on or before
+            this date. ISO 8601 format.
 
     Returns:
         JSON array of matching email summaries, or an error.
     """
+    if not query and not sender and not body:
+        return json.dumps({"error": "Provide at least one search criterion: query, sender, or body"})
+
     folder_ref = resolve_folder_ref(folder)
-    safe_query = escape(query)
+
+    # Subject filter via AppleScript whose clause (fast, server-side)
+    if query:
+        safe_query = escape(query)
+        whose_clause = f' whose subject contains "{safe_query}"'
+    else:
+        whose_clause = ""
+
+    # Post-filtering needed for sender, body, or date
+    needs_post_filter = bool(sender or body or start_date or end_date)
+    prefetch_count = min(count * 10, 200) if needs_post_filter else count
+
+    # Only fetch body text when body search is requested (expensive)
+    if body:
+        body_fetch = '''
+        set mbody to ""
+        try
+            set mbody to plain text content of m
+        end try'''
+        body_output = f' & "{DELIM}" & mbody'
+    else:
+        body_fetch = ""
+        body_output = ""
 
     script = f'''tell application "Microsoft Outlook"
     set folderRef to {folder_ref}
-    set matchMsgs to messages of folderRef whose subject contains "{safe_query}"
+    set matchMsgs to messages of folderRef{whose_clause}
     set msgCount to count of matchMsgs
-    set maxCount to {count}
+    set maxCount to {prefetch_count}
     if msgCount < maxCount then set maxCount to msgCount
     set output to ""
     repeat with i from 1 to maxCount
@@ -559,8 +600,8 @@ async def search_emails(
         set mattcount to 0
         try
             set mattcount to count of attachments of m
-        end try
-        set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
+        end try{body_fetch}
+        set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text){body_output} & "{RECORD_DELIM}"
     end repeat
     return output
 end tell'''
@@ -570,6 +611,12 @@ end tell'''
         if not raw:
             return json.dumps([])
 
+        # Prepare post-filter values
+        sender_lower = sender.lower() if sender else ""
+        body_lower = body.lower() if body else ""
+        start_dt = datetime.fromisoformat(start_date) if start_date else None
+        end_dt = datetime.fromisoformat(end_date) if end_date else None
+
         results = []
         for record in raw.split(RECORD_DELIM):
             record = record.strip()
@@ -578,17 +625,54 @@ end tell'''
             parts = record.split(DELIM)
             if len(parts) < 7:
                 continue
+
+            entry_id = parts[0].strip()
+            subject = parts[1].strip() or "(no subject)"
+            sender_addr = parts[2].strip()
+            sender_name = parts[3].strip()
+            received_time = _clean(parts[4])
+            is_read = parts[5].strip()
             att_count = int(parts[6].strip()) if parts[6].strip().isdigit() else 0
+            # Body is the last field — join remaining parts in case body
+            # itself contained the delimiter
+            msg_body = DELIM.join(parts[7:]) if body and len(parts) > 7 else ""
+
+            # Post-filter: sender (name or address)
+            if sender_lower:
+                if (sender_lower not in sender_addr.lower()
+                        and sender_lower not in sender_name.lower()):
+                    continue
+
+            # Post-filter: body
+            if body_lower and body_lower not in msg_body.lower():
+                continue
+
+            # Post-filter: date range
+            if start_dt or end_dt:
+                try:
+                    msg_iso = parse_date(received_time)
+                    msg_dt = datetime.fromisoformat(msg_iso)
+                except (ValueError, TypeError):
+                    continue
+                if start_dt and msg_dt < start_dt:
+                    continue
+                if end_dt and msg_dt > end_dt:
+                    continue
+
             results.append({
-                "entry_id": parts[0].strip(),
-                "subject": parts[1].strip() or "(no subject)",
-                "sender": parts[2].strip(),
-                "sender_name": parts[3].strip(),
-                "received_time": _clean(parts[4]),
-                "unread": parts[5].strip().lower() != "true",
+                "entry_id": entry_id,
+                "subject": subject,
+                "sender": sender_addr,
+                "sender_name": sender_name,
+                "received_time": received_time,
+                "unread": is_read.lower() != "true",
                 "has_attachments": att_count > 0,
                 "attachment_count": att_count,
             })
+
+            if len(results) >= count:
+                break
+
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error searching emails: {e}"

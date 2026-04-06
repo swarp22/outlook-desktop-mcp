@@ -98,7 +98,7 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 |------|:-------:|:-----:|-------------|
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
-| `search_emails` | yes | yes | Full-text search across email subjects and bodies |
+| `search_emails` | yes | yes | Search by subject, sender, body text, and/or date range |
 | `list_folders` | yes | yes | Browse the folder hierarchy with item counts |
 
 ### Calendar
@@ -169,7 +169,7 @@ Each tool constructs a single AppleScript that fetches all needed data in one `o
 
 - Entry IDs on macOS are **numeric** (e.g. `42`), not hex strings. They identify items within their folder context.
 - Folder references use AppleScript's **locale-independent keywords** (`inbox`, `sent items`, `drafts`, `deleted items`) rather than localized folder names.
-- Search uses AppleScript's `whose` clause (e.g. `messages whose subject contains "query"`) instead of DASL filters.
+- Search uses a two-stage approach: AppleScript's `whose` clause pre-filters by subject, then Python post-filters by sender, body text, and date range. Body text is only fetched when explicitly searched (to avoid overhead).
 - User input is escaped for safe embedding in AppleScript strings to prevent script injection.
 
 ## Install from Source
@@ -215,6 +215,8 @@ Once registered, just talk to Claude naturally:
 - *"Read the email from Taylor about MLADS"*
 - *"What's on my calendar this week?"*
 - *"Search for emails about the quarterly report"*
+- *"Find emails from Mueller in the last two weeks"*
+- *"Search my inbox for emails mentioning 'invoice' in the body"*
 - *"Save the attachment from that email to my Downloads folder"*
 - *"What tasks are due this week?"*
 
