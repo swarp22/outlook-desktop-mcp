@@ -70,28 +70,52 @@ def _truncate(text: str, max_length: int = 5000) -> str:
     return text[:max_length] + "\n... [truncated]"
 
 
-# AppleScript block to extract sender address and name with Exchange fallbacks.
-# Exchange/O365 senders are often opaque objects where direct property access
-# (address of sender, name of sender) silently fails. We try multiple approaches:
-#   1. Direct property access (works for SMTP senders)
-#   2. String coercion of the sender object (often returns display name)
-#   3. Extracting from the "From" content header as last resort
-# Expects variable `m` (message) to be set. Sets `msender` and `msenderName`.
+# AppleScript block to extract sender info from the raw MIME source.
+# On Exchange/O365 accounts, the sender object's properties (address of sender,
+# name of sender) silently fail or return empty strings. Parsing the From: header
+# from `source of m` is the only reliable method that works across SMTP and
+# Exchange accounts. We extract the raw From: line and parse name/address in Python.
+# Expects variable `m` (message) to be set. Sets `mfrom` (raw From: header value).
 APPLESCRIPT_SENDER_BLOCK = '''
-        set msender to ""
-        set msenderName to ""
+        set mfrom to ""
         try
-            set msender to address of sender of m
-        end try
-        try
-            set msenderName to name of sender of m
-        end try
-        if msender is "" and msenderName is "" then
-            try
-                set sStr to (sender of m) as text
-                if sStr is not "missing value" then set msenderName to sStr
-            end try
-        end if'''
+            set src to source of m
+            set srcLines to paragraphs of src
+            repeat with aLine in srcLines
+                if aLine starts with "From:" then
+                    set mfrom to text 7 thru -1 of (contents of aLine)
+                    exit repeat
+                end if
+            end repeat
+        end try'''
+
+
+def _parse_from_header(raw: str) -> tuple[str, str]:
+    """Parse a raw From: header value into (address, display_name).
+
+    Handles common formats:
+      "Display Name" <user@example.com>
+      Display Name <user@example.com>
+      user@example.com
+      <user@example.com>
+    """
+    raw = raw.strip()
+    if not raw:
+        return "", ""
+
+    # Format: ... <email>
+    match = re.match(r'^(.*?)\s*<([^>]+)>\s*$', raw)
+    if match:
+        name = match.group(1).strip().strip('"').strip()
+        addr = match.group(2).strip()
+        return addr, name
+
+    # Plain email address
+    if "@" in raw:
+        return raw, ""
+
+    # Just a name, no address
+    return "", raw
 
 
 def _clean(value: str) -> str:
@@ -284,7 +308,7 @@ async def list_emails(
         try
             set mattcount to count of attachments of m
         end try
-        set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
+        set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & mfrom & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
     end repeat
     return output
 end tell'''
@@ -299,16 +323,17 @@ end tell'''
                 if not record:
                     continue
                 parts = record.split(DELIM)
-                if len(parts) < 7:
+                if len(parts) < 6:
                     continue
-                att_count = int(parts[6]) if parts[6].strip().isdigit() else 0
+                att_count = int(parts[5]) if parts[5].strip().isdigit() else 0
+                sender_addr, sender_name = _parse_from_header(parts[2])
                 results.append({
                     "entry_id": parts[0].strip(),
                     "subject": parts[1].strip() or "(no subject)",
-                    "sender": parts[2].strip(),
-                    "sender_name": parts[3].strip(),
-                    "received_time": _clean(parts[4]),
-                    "unread": parts[5].strip().lower() != "true",  # is_read -> unread
+                    "sender": sender_addr,
+                    "sender_name": sender_name,
+                    "received_time": _clean(parts[3]),
+                    "unread": parts[4].strip().lower() != "true",  # is_read -> unread
                     "has_attachments": att_count > 0,
                     "attachment_count": att_count,
                 })
@@ -385,7 +410,7 @@ async def read_email(
     try
         set mbody to plain text content of m
     end try
-    return (mid as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbody
+    return (mid as text) & "{DELIM}" & msubject & "{DELIM}" & mfrom & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbody
 end tell'''
     elif subject_search:
         folder_ref = resolve_folder_ref(folder)
@@ -421,7 +446,7 @@ end tell'''
     try
         set mbody to plain text content of m
     end try
-    return (mid as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbody
+    return (mid as text) & "{DELIM}" & msubject & "{DELIM}" & mfrom & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbody
 end tell'''
     else:
         return json.dumps({"error": "Provide either entry_id or subject_search"})
@@ -431,23 +456,24 @@ end tell'''
         if raw == "NOT_FOUND":
             return json.dumps({"error": f"No email found matching '{subject_search}'"})
 
-        parts = raw.split(DELIM, 9)  # max 10 parts
-        if len(parts) < 10:
+        parts = raw.split(DELIM, 8)  # max 9 parts
+        if len(parts) < 9:
             return json.dumps({"error": "Failed to parse email data"})
 
-        att_count = int(parts[6].strip()) if parts[6].strip().isdigit() else 0
+        sender_addr, sender_name = _parse_from_header(parts[2])
+        att_count = int(parts[5].strip()) if parts[5].strip().isdigit() else 0
         result = {
             "entry_id": parts[0].strip(),
             "subject": parts[1].strip() or "(no subject)",
-            "sender": parts[2].strip(),
-            "sender_name": parts[3].strip(),
-            "received_time": _clean(parts[4]),
-            "unread": parts[5].strip().lower() != "true",
+            "sender": sender_addr,
+            "sender_name": sender_name,
+            "received_time": _clean(parts[3]),
+            "unread": parts[4].strip().lower() != "true",
             "has_attachments": att_count > 0,
             "attachment_count": att_count,
-            "to": parts[7].strip(),
-            "cc": parts[8].strip(),
-            "body": _truncate(_clean(parts[9])),
+            "to": parts[6].strip(),
+            "cc": parts[7].strip(),
+            "body": _truncate(_clean(parts[8])),
         }
         return json.dumps(result, indent=2, default=str)
     except Exception as e:
@@ -572,7 +598,7 @@ async def search_emails(
         safe_sender = escape(sender)
         sender_filter_block = f'''
         if isMatch then
-            if msender does not contain "{safe_sender}" and msenderName does not contain "{safe_sender}" then
+            if mfrom does not contain "{safe_sender}" then
                 set isMatch to false
             end if
         end if'''
@@ -614,7 +640,7 @@ async def search_emails(
             try
                 set mattcount to count of attachments of m
             end try
-            set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
+            set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & mfrom & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
         end if
     end repeat
     return output
@@ -639,10 +665,11 @@ end tell'''
             if not record:
                 continue
             parts = record.split(DELIM)
-            if len(parts) < 7:
+            if len(parts) < 6:
                 continue
 
-            received_time = _clean(parts[4])
+            sender_addr, sender_name = _parse_from_header(parts[2])
+            received_time = _clean(parts[3])
 
             # Post-filter: date range
             if start_dt or end_dt:
@@ -656,14 +683,14 @@ end tell'''
                 if end_dt and msg_dt > end_dt:
                     continue
 
-            att_count = int(parts[6].strip()) if parts[6].strip().isdigit() else 0
+            att_count = int(parts[5].strip()) if parts[5].strip().isdigit() else 0
             results.append({
                 "entry_id": parts[0].strip(),
                 "subject": parts[1].strip() or "(no subject)",
-                "sender": parts[2].strip(),
-                "sender_name": parts[3].strip(),
+                "sender": sender_addr,
+                "sender_name": sender_name,
                 "received_time": received_time,
-                "unread": parts[5].strip().lower() != "true",
+                "unread": parts[4].strip().lower() != "true",
                 "has_attachments": att_count > 0,
                 "attachment_count": att_count,
             })
