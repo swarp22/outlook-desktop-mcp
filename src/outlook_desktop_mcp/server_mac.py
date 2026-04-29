@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge
 from outlook_desktop_mcp.utils.applescript_helpers import (
+    applescript_date_var,
     escape,
     parse_date,
     resolve_folder_ref,
@@ -538,21 +539,26 @@ end tell'''
 # TOOL 9: search_emails
 # =====================================================================
 
+# Matches "YYYY-MM-DD" with no time component \u2014 used to detect end_date inputs
+# that should be treated as end-of-day rather than midnight.
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 @mcp.tool()
 async def search_emails(
     query: str = "",
     sender: str = "",
     body: str = "",
-    folder: str = "inbox",
-    count: int = 10,
+    folder: str = "",
+    count: int = 0,
     start_date: str = "",
     end_date: str = "",
 ) -> str:
-    """Search for emails in Outlook using text search.
+    """Search for emails in Outlook.
 
-    Searches across subject, sender, and/or body text. All provided
-    criteria are combined with AND logic. At least one of query, sender,
-    or body must be provided.
+    Combines subject, sender, body, and/or date-range filters with AND
+    logic. At least one criterion (query, sender, body, start_date, or
+    end_date) must be provided.
 
     Args:
         query: Search term for email subjects (case-insensitive substring).
@@ -563,125 +569,255 @@ async def search_emails(
         body: Search term for the email body text (case-insensitive
             substring). Note: body search fetches message content and
             may be slower for large folders.
-        folder: Folder to search in. Default "inbox". Supports same
-            names as list_emails.
-        count: Maximum results to return. Default 10.
+        folder: Folder to search. Empty (default) searches every mail
+            folder recursively (including subfolders). Pass a name like
+            "inbox" or "Archiv" to limit to one folder. See list_folders
+            for available names.
+        count: Maximum results to return. 0 (default) means auto: 10 for
+            text-only searches, 1000 for searches that include a date
+            range \u2014 date-bounded searches are intended to be exhaustive
+            (e.g. "all mails from yesterday across every folder").
+            Pass a positive integer to override.
         start_date: Optional. Only return emails received on or after
-            this date. ISO 8601 format (e.g. "2026-03-10").
+            this date. ISO 8601 (e.g. "2026-03-10" or "2026-03-10 09:00").
         end_date: Optional. Only return emails received on or before
-            this date. ISO 8601 format.
+            this date. ISO 8601. A date-only value (no time component)
+            is treated as end-of-day (23:59:59) for convenience.
 
     Returns:
-        JSON array of matching email summaries, or an error.
+        JSON array of matching email summaries. Each summary includes the
+        source ``folder`` name, useful when searching across folders. When
+        a date range is given, every folder is traversed exhaustively and
+        results are sorted newest-first before truncation to ``count``.
     """
-    if not query and not sender and not body:
-        return json.dumps({"error": "Provide at least one search criterion: query, sender, or body"})
+    if not (query or sender or body or start_date or end_date):
+        return json.dumps({
+            "error": "Provide at least one search criterion: "
+                     "query, sender, body, start_date, or end_date"
+        })
 
-    folder_ref = resolve_folder_ref(folder)
+    # --- Parse dates (reject invalid input early) ---
+    try:
+        start_dt = datetime.fromisoformat(start_date) if start_date else None
+    except ValueError:
+        return json.dumps({"error": f"Invalid start_date (use ISO 8601): {start_date!r}"})
+    try:
+        end_dt = datetime.fromisoformat(end_date) if end_date else None
+    except ValueError:
+        return json.dumps({"error": f"Invalid end_date (use ISO 8601): {end_date!r}"})
 
-    # Subject filter via AppleScript whose clause (fast, server-side)
+    # Convenience: a bare date as end_date means "the whole of that day".
+    # Without this, search(start="2026-04-27", end="2026-04-27") matches
+    # only mails arrived exactly at midnight.
+    if end_dt and _DATE_ONLY_RE.match(end_date.strip()):
+        end_dt = end_dt.replace(hour=23, minute=59, second=59)
+
+    has_date_filter = bool(start_dt or end_dt)
+
+    # Resolve auto count: a date-bounded query is meant to be exhaustive
+    # ("alle Mails von gestern"), so default high. Pure text queries keep
+    # the legacy default of 10 to avoid pulling huge result sets.
+    auto_count = count <= 0
+    if auto_count:
+        count = 1000 if has_date_filter else 10
+
+    # Exhaustive scan = visit every folder unconditionally. Only do this
+    # when the caller did NOT specify a count and we have a date filter
+    # to keep the result set bounded. An explicit small count means the
+    # caller wants speed and early termination is correct.
+    exhaustive = has_date_filter and auto_count
+
+    # --- Build the AppleScript whose clause and date-construction block ---
+    # AppleScript's `date "ISO-string"` literal is parsed via the system
+    # locale, which mangles ISO strings on non-English Macs. Construct the
+    # date programmatically via numeric setters instead.
+    date_block = ""
+    whose_parts = []
+
     if query:
-        safe_query = escape(query)
-        whose_clause = f' whose subject contains "{safe_query}"'
-    else:
-        whose_clause = ""
+        whose_parts.append(f'(subject contains "{escape(query)}")')
+    if start_dt:
+        date_block += applescript_date_var("startDate", start_dt)
+        whose_parts.append("(time received \u2265 startDate)")
+    if end_dt:
+        date_block += applescript_date_var("endDate", end_dt)
+        whose_parts.append("(time received \u2264 endDate)")
 
-    # Sender/body filtering happens inside the AppleScript loop.
-    # This avoids transferring hundreds of non-matching messages and
-    # prevents timeouts when no whose clause narrows the result set.
+    whose_clause = (" whose " + " and ".join(whose_parts)) if whose_parts else ""
+
+    # Sender/body filtering happens inside the loop (no whose-clause
+    # support for these properties on Exchange messages).
     needs_loop_filter = bool(sender or body)
-    scan_limit = min(count * 20, 500) if needs_loop_filter else count
+    # With a date filter, the whose-clause already prunes results heavily
+    # per folder, so a generous per-folder scan limit is safe and cheap.
+    if has_date_filter:
+        scan_limit = 1000
+    elif needs_loop_filter:
+        scan_limit = min(count * 20, 500)
+    else:
+        scan_limit = count
 
-    # Build conditional filter blocks for the AppleScript repeat loop
     sender_filter_block = ""
     if sender:
         safe_sender = escape(sender)
         sender_filter_block = f'''
-        if isMatch then
-            if mfrom does not contain "{safe_sender}" then
-                set isMatch to false
-            end if
-        end if'''
+            if isMatch then
+                if mfrom does not contain "{safe_sender}" then
+                    set isMatch to false
+                end if
+            end if'''
 
     body_filter_block = ""
     if body:
         safe_body = escape(body)
         body_filter_block = f'''
-        if isMatch then
-            set mbody to ""
-            try
-                set mbody to plain text content of m
-            end try
-            if mbody does not contain "{safe_body}" then
-                set isMatch to false
-            end if
-        end if'''
+            if isMatch then
+                set mbody to ""
+                try
+                    set mbody to plain text content of m
+                end try
+                if mbody does not contain "{safe_body}" then
+                    set isMatch to false
+                end if
+            end if'''
 
-    script = f'''tell application "Microsoft Outlook"
-    set folderRef to {folder_ref}
-    set allMsgs to messages of folderRef{whose_clause}
-    set msgCount to count of allMsgs
-    set maxScan to {scan_limit}
-    if msgCount < maxScan then set maxScan to msgCount
+    # In exhaustive mode we visit every folder unconditionally \u2014 the
+    # whose-clause keeps the per-folder match count tiny. Otherwise we
+    # bail out as soon as the global cap is hit, both inside the per-folder
+    # loop and in the outer queue.
+    if exhaustive:
+        inner_break = ""
+        outer_break_cond = ""
+    else:
+        inner_break = "\n                if matchCount \u2265 maxResults then exit repeat"
+        outer_break_cond = " and matchCount < maxResults"
+
+    # --- Inner per-message loop, shared by single- and multi-folder paths ---
+    # Cheap pre-check: skip folders with zero messages so the (expensive)
+    # `whose`-evaluation never runs against empty mailboxes. On large
+    # accounts roughly half the custom folders are empty.
+    inner_loop = f'''        set folderHasMail to true
+        try
+            if (count of messages of f) is 0 then set folderHasMail to false
+        end try
+        if folderHasMail then try
+            set allMsgs to messages of f{whose_clause}
+            set msgCount to count of allMsgs
+            set maxScan to {scan_limit}
+            if msgCount < maxScan then set maxScan to msgCount
+            repeat with i from 1 to maxScan{inner_break}
+                set m to item i of allMsgs{APPLESCRIPT_SENDER_BLOCK}
+                set isMatch to true{sender_filter_block}{body_filter_block}
+                if isMatch then
+                    set matchCount to matchCount + 1
+                    set mid to id of m
+                    set msubject to subject of m
+                    set mtime to time received of m as string
+                    set misread to is read of m
+                    set mattcount to 0
+                    try
+                        set mattcount to count of attachments of m
+                    end try
+                    set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & mfrom & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{DELIM}" & folderName & "{RECORD_DELIM}"
+                end if
+            end repeat
+        end try'''
+
+    multi_folder = not folder.strip()
+
+    if multi_folder:
+        # Walk the entire folder tree breadth-first via a worklist queue.
+        # AppleScript lets us mutate the list during iteration, so newly
+        # discovered subfolders are simply appended.
+        script = f'''tell application "Microsoft Outlook"
+{date_block}    set folderQueue to (mail folders) as list
+    set qIdx to 1
     set matchCount to 0
     set maxResults to {count}
     set output to ""
-    repeat with i from 1 to maxScan
-        if matchCount \u2265 maxResults then exit repeat
-        set m to item i of allMsgs{APPLESCRIPT_SENDER_BLOCK}
-        set isMatch to true{sender_filter_block}{body_filter_block}
-        if isMatch then
-            set matchCount to matchCount + 1
-            set mid to id of m
-            set msubject to subject of m
-            set mtime to time received of m as string
-            set misread to is read of m
-            set mattcount to 0
-            try
-                set mattcount to count of attachments of m
-            end try
-            set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & mfrom & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
-        end if
+    repeat while qIdx \u2264 (count of folderQueue){outer_break_cond}
+        set f to item qIdx of folderQueue
+        set qIdx to qIdx + 1
+        set folderName to ""
+        try
+            set folderName to name of f
+        end try
+        try
+            repeat with sf in (mail folders of f)
+                set end of folderQueue to contents of sf
+            end repeat
+        end try
+{inner_loop}
     end repeat
     return output
 end tell'''
+    else:
+        folder_ref = resolve_folder_ref(folder)
+        script = f'''tell application "Microsoft Outlook"
+{date_block}    set f to {folder_ref}
+    set folderName to ""
+    try
+        set folderName to name of f
+    end try
+    set matchCount to 0
+    set maxResults to {count}
+    set output to ""
+{inner_loop}
+    return output
+end tell'''
 
-    # Sender/body loop filtering may need more time for large folders
-    script_timeout = 60 if needs_loop_filter else 30
+    # Multi-folder traversal and loop filtering both need extra headroom.
+    # Exhaustive scans across every folder are the most expensive case
+    # (~270 folders × ~600ms each on the test mailbox).
+    if multi_folder and exhaustive:
+        script_timeout = 300
+    elif multi_folder and needs_loop_filter:
+        script_timeout = 180
+    elif multi_folder or needs_loop_filter:
+        script_timeout = 90
+    else:
+        script_timeout = 30
 
     try:
         raw = await bridge.run(script, timeout=script_timeout)
         if not raw:
             return json.dumps([])
 
-        # Date filtering remains in Python (AppleScript date comparison
-        # is locale-dependent and unreliable)
-        start_dt = datetime.fromisoformat(start_date) if start_date else None
-        end_dt = datetime.fromisoformat(end_date) if end_date else None
-
+        # Python-side date filter as a safety net: AppleScript's whose-clause
+        # comparison is fast but has known reliability issues on Outlook for Mac.
+        # Filtering again here can only drop false positives, never miss a hit.
         results = []
         for record in raw.split(RECORD_DELIM):
             record = record.strip()
             if not record:
                 continue
             parts = record.split(DELIM)
-            if len(parts) < 6:
+            if len(parts) < 7:
                 continue
 
             sender_addr, sender_name = _parse_from_header(parts[2])
             received_time = _clean(parts[3])
 
-            # Post-filter: date range
+            sort_key = None
             if start_dt or end_dt:
                 try:
                     msg_iso = parse_date(received_time)
                     msg_dt = datetime.fromisoformat(msg_iso)
                 except (ValueError, TypeError):
-                    continue
-                if start_dt and msg_dt < start_dt:
-                    continue
-                if end_dt and msg_dt > end_dt:
-                    continue
+                    msg_dt = None
+                if msg_dt is not None:
+                    if start_dt and msg_dt < start_dt:
+                        continue
+                    if end_dt and msg_dt > end_dt:
+                        continue
+                    sort_key = msg_dt
+            elif received_time:
+                # Best-effort sort key for non-date queries — falls through to
+                # AppleScript's natural folder order if parsing fails.
+                try:
+                    sort_key = datetime.fromisoformat(parse_date(received_time))
+                except (ValueError, TypeError):
+                    sort_key = None
 
             att_count = int(parts[5].strip()) if parts[5].strip().isdigit() else 0
             results.append({
@@ -693,7 +829,22 @@ end tell'''
                 "unread": parts[4].strip().lower() != "true",
                 "has_attachments": att_count > 0,
                 "attachment_count": att_count,
+                "folder": parts[6].strip(),
+                "_sort_key": sort_key,
             })
+
+        # For exhaustive date scans across folders, sort newest-first so that
+        # any truncation drops the oldest hits, not whichever folder happened
+        # to be visited last by the BFS walk.
+        if exhaustive:
+            results.sort(
+                key=lambda r: r["_sort_key"] or datetime.min,
+                reverse=True,
+            )
+        if len(results) > count:
+            results = results[:count]
+        for r in results:
+            r.pop("_sort_key", None)
 
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
