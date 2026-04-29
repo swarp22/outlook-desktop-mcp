@@ -26,6 +26,30 @@ def format_date(dt: datetime) -> str:
     return f'date "{dt.strftime("%Y-%m-%d %H:%M:%S")}"'
 
 
+def applescript_date_var(var_name: str, dt: datetime, indent: str = "    ") -> str:
+    """Build an AppleScript snippet that assigns ``dt`` to ``var_name``.
+
+    Constructs the date programmatically (numeric components) instead of via
+    a ``date "..."`` literal. AppleScript parses date literals through the
+    system locale, which mis-parses ISO strings like ``"2026-04-27 00:00:00"``
+    in non-English locales (e.g. de_DE turns it into 16. Oktober 2032).
+    Numeric assignment is locale-independent.
+
+    Sets ``day`` to 1 first so a later month change cannot overflow (e.g. it
+    avoids March when assigning month=2 to a date currently on the 31st).
+    """
+    return (
+        f"{indent}set {var_name} to current date\n"
+        f"{indent}set day of {var_name} to 1\n"
+        f"{indent}set year of {var_name} to {dt.year}\n"
+        f"{indent}set month of {var_name} to {dt.month}\n"
+        f"{indent}set day of {var_name} to {dt.day}\n"
+        f"{indent}set hours of {var_name} to {dt.hour}\n"
+        f"{indent}set minutes of {var_name} to {dt.minute}\n"
+        f"{indent}set seconds of {var_name} to {dt.second}\n"
+    )
+
+
 def parse_date(text: str) -> str:
     """Parse an AppleScript date string to ISO 8601 format.
 
