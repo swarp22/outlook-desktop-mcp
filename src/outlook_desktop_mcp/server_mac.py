@@ -569,10 +569,16 @@ async def search_emails(
         body: Search term for the email body text (case-insensitive
             substring). Note: body search fetches message content and
             may be slower for large folders.
-        folder: Folder to search. Empty (default) searches every mail
-            folder recursively (including subfolders). Pass a name like
-            "inbox" or "Archiv" to limit to one folder. See list_folders
-            for available names.
+        folder: Folder(s) to search. Subfolder trees are always included.
+            - Empty (default) → search every mail folder recursively.
+              Slow on large mailboxes; the MCP client may time out at ~60s.
+            - Single name like "inbox" or "Archiv" → that folder plus
+              all its subfolders.
+            - Comma-separated list like "inbox,sent,trash" → exactly those
+              folders plus each one's subfolder tree. Recommended for
+              "received + sent + deleted today" queries: ~3-5s, well
+              within client timeouts.
+            See list_folders for available names.
         count: Maximum results to return. 0 (default) means auto: 10 for
             text-only searches, 1000 for searches that include a date
             range \u2014 date-bounded searches are intended to be exhaustive
@@ -723,14 +729,24 @@ async def search_emails(
             end repeat
         end try'''
 
-    multi_folder = not folder.strip()
+    # Parse the folder argument: empty \u2192 all folders, otherwise comma-split.
+    # The BFS walk picks up subfolders for free, so single and multi specs
+    # share the same code path. Subfolder inclusion keeps "search the inbox"
+    # intuitive and robust against custom subfolder layouts.
+    folder_specs = [s.strip() for s in folder.split(",") if s.strip()]
 
-    if multi_folder:
-        # Walk the entire folder tree breadth-first via a worklist queue.
-        # AppleScript lets us mutate the list during iteration, so newly
-        # discovered subfolders are simply appended.
-        script = f'''tell application "Microsoft Outlook"
-{date_block}    set folderQueue to (mail folders) as list
+    if not folder_specs:
+        seed_clause = "set folderQueue to (mail folders) as list"
+        # `mail folders` is already a list \u2014 wrap nothing extra
+    else:
+        # Build {ref1, ref2, ...} as the initial worklist. Each ref must be
+        # a valid AppleScript expression in this context (e.g. `inbox`,
+        # `sent items`, or `mail folder "Archiv"` for custom names).
+        seed_items = ", ".join(resolve_folder_ref(s) for s in folder_specs)
+        seed_clause = f"set folderQueue to {{{seed_items}}}"
+
+    script = f'''tell application "Microsoft Outlook"
+{date_block}    {seed_clause}
     set qIdx to 1
     set matchCount to 0
     set maxResults to {count}
@@ -751,32 +767,23 @@ async def search_emails(
     end repeat
     return output
 end tell'''
-    else:
-        folder_ref = resolve_folder_ref(folder)
-        script = f'''tell application "Microsoft Outlook"
-{date_block}    set f to {folder_ref}
-    set folderName to ""
-    try
-        set folderName to name of f
-    end try
-    set matchCount to 0
-    set maxResults to {count}
-    set output to ""
-{inner_loop}
-    return output
-end tell'''
 
-    # Multi-folder traversal and loop filtering both need extra headroom.
-    # Exhaustive scans across every folder are the most expensive case
-    # (~270 folders × ~600ms each on the test mailbox).
-    if multi_folder and exhaustive:
+
+    # Timeout heuristic:
+    #   - exhaustive over every folder ≈ 270 folders × ~600ms = 120-180s
+    #   - all-folder early-exit / sender+body filtering ≈ up to 90s
+    #   - named-folder list with subfolders ≈ 3-15s on typical use cases
+    # The Claude Desktop MCP client hardcodes a 60s tool-call timeout, so
+    # named-folder use cases are the sweet spot — they finish well under it.
+    scans_all = not folder_specs
+    if scans_all and exhaustive:
         script_timeout = 300
-    elif multi_folder and needs_loop_filter:
+    elif scans_all and needs_loop_filter:
         script_timeout = 180
-    elif multi_folder or needs_loop_filter:
+    elif scans_all or needs_loop_filter:
         script_timeout = 90
     else:
-        script_timeout = 30
+        script_timeout = 60
 
     try:
         raw = await bridge.run(script, timeout=script_timeout)

@@ -78,8 +78,14 @@ def parse_date(text: str) -> str:
     return text
 
 
-# Locale-independent AppleScript folder keywords
+# Locale-independent AppleScript folder keywords. We accept English and
+# German aliases because Outlook for Mac on a localized account has both
+# the English keyword (e.g. `inbox`) AND a localized custom folder
+# ("Posteingang") in `list_folders` output. Looking up `mail folder
+# "Posteingang"` would hit the empty On-My-Computer copy first, so we
+# route the localized name to the same keyword that targets Exchange.
 FOLDER_MAP = {
+    # English
     "inbox": "inbox",
     "sent": "sent items",
     "sentmail": "sent items",
@@ -89,8 +95,23 @@ FOLDER_MAP = {
     "deleted items": "deleted items",
     "trash": "deleted items",
     "junk": "junk mail",
+    "junk mail": "junk mail",
     "spam": "junk mail",
     "outbox": "outbox",
+    # German
+    "posteingang": "inbox",
+    "gesendet": "sent items",
+    "gesendete": "sent items",
+    "gesendete elemente": "sent items",
+    "entwürfe": "drafts",
+    "entwurf": "drafts",
+    "gelöscht": "deleted items",
+    "gelöschte": "deleted items",
+    "gelöschte elemente": "deleted items",
+    "papierkorb": "deleted items",
+    "junk-e-mail": "junk mail",
+    "junk e-mail": "junk mail",
+    "postausgang": "outbox",
 }
 
 
